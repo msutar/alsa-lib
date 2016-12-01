@@ -572,6 +572,9 @@ int snd_pcm_direct_poll_revents(snd_pcm_t *pcm, struct pollfd *pfds, unsigned in
 	}
 	switch (snd_pcm_state(dmix->spcm)) {
 	case SND_PCM_STATE_XRUN:
+		/*recover slave and update client state to xrun before returning POLLERR*/
+		snd_pcm_direct_slave_recover(dmix);
+		snd_pcm_direct_client_chk_xrun(dmix, pcm);
 	case SND_PCM_STATE_SUSPENDED:
 	case SND_PCM_STATE_SETUP:
 		events |= POLLERR;
@@ -964,6 +967,83 @@ static void save_slave_setting(snd_pcm_direct_t *dmix, snd_pcm_t *spcm)
 }
 
 #undef COPY_SLAVE
+
+#define direct_sem_down_chk_ret(d, id) {\
+	int semerr = snd_pcm_direct_semaphore_down(d, DIRECT_IPC_SEM_CLIENT); \
+	if (semerr) {\
+		SNDERR("SEMDOWN FAILED with err %d", semerr);\
+		return semerr;\
+	}\
+}
+
+#define direct_sem_up_chk_ret(d, id) {\
+	int semerr = snd_pcm_direct_semaphore_up(d, DIRECT_IPC_SEM_CLIENT); \
+	if (semerr) {\
+		SNDERR("SEMUP FAILED with err %d", semerr);\
+		return semerr;\
+	}\
+}
+
+/*
+ * Recover slave on XRUN.
+ * Even if direct plugins disable xrun detection, there might be an xrun raised directly by some drivers.
+ * The first client recovers slave pcm.
+ * Each client needs to execute sw xrun handling afterwards
+ */
+int snd_pcm_direct_slave_recover(snd_pcm_direct_t *direct)
+{
+	int ret = 0;
+
+	direct_sem_down_chk_ret(direct, DIRECT_IPC_SEM_CLIENT);
+	if (snd_pcm_state(direct->spcm) != SND_PCM_STATE_XRUN) {
+		/*ignore... someone else already did recovery*/
+		direct_sem_up_chk_ret(direct, DIRECT_IPC_SEM_CLIENT);
+		return ret;
+	}
+
+	ret = snd_pcm_prepare(direct->spcm);
+	if (ret < 0) {
+		SNDERR("recover: unable to prepare slave");
+		direct_sem_up_chk_ret(direct, DIRECT_IPC_SEM_CLIENT);
+		return ret;
+	}
+
+	if (direct->type == SND_PCM_TYPE_DSHARE) {
+		const snd_pcm_channel_area_t *dst_areas;
+		dst_areas = snd_pcm_mmap_areas(direct->spcm);
+		snd_pcm_areas_silence(dst_areas, 0, direct->spcm->channels, direct->spcm->buffer_size, direct->spcm->format);
+	}
+
+	ret = snd_pcm_start(direct->spcm);
+	if (ret < 0) {
+		SNDERR("recover: unable to start slave");
+		direct_sem_up_chk_ret(direct, DIRECT_IPC_SEM_CLIENT);
+		return ret;
+	}
+	direct->shmptr->recoveries++;
+	direct_sem_up_chk_ret(direct, DIRECT_IPC_SEM_CLIENT);
+	return 0;
+}
+
+/*
+ * enter xrun state, if slave xrun occured
+ * @return: 0 - no xrun >0: xrun happened
+ */
+int snd_pcm_direct_client_chk_xrun(snd_pcm_direct_t *direct, snd_pcm_t *pcm)
+{
+	if (direct->shmptr->recoveries != direct->recoveries) {
+		/* no matter how many xruns we missed - so don't increment but just update to actual counter*/
+		direct->recoveries = direct->shmptr->recoveries;
+		pcm->fast_ops->drop(pcm);
+		/*trigger_tstamp update is missing in drop callbacks*/
+		gettimestamp(&direct->trigger_tstamp, pcm->tstamp_type);
+		/*no timer clear: if slave already entered xrun again the event is lost...*/
+		/*snd_pcm_direct_clear_timer_queue(direct);*/
+		direct->state = SND_PCM_STATE_XRUN;
+		return 1;
+	}
+	return 0;
+}
 
 /*
  * this function initializes hardware and starts playback operation with
@@ -1380,6 +1460,7 @@ int snd_pcm_direct_open_secondary_client(snd_pcm_t **spcmp, snd_pcm_direct_t *dm
 	dmix->slave_buffer_size = spcm->buffer_size;
 	dmix->slave_period_size = dmix->shmptr->s.period_size;
 	dmix->slave_boundary = spcm->boundary;
+	dmix->recoveries = dmix->shmptr->recoveries;
 
 	ret = snd_pcm_mmap(spcm);
 	if (ret < 0) {
