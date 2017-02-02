@@ -64,6 +64,10 @@ static int snd_pcm_plug_close(snd_pcm_t *pcm)
 	snd_pcm_plug_t *plug = pcm->private_data;
 	int err, result = 0;
 	free(plug->ttable);
+	if (plug->rate_converter) {
+		snd_config_delete((snd_config_t*)plug->rate_converter);
+		plug->rate_converter = NULL;
+	}
 	assert(plug->gen.slave == plug->req_slave);
 	if (plug->gen.close_slave) {
 		snd_pcm_unlink_hw_ptr(pcm, plug->req_slave);
@@ -1108,7 +1112,14 @@ int snd_pcm_plug_open(snd_pcm_t **pcmp,
 	plug->sformat = sformat;
 	plug->schannels = schannels;
 	plug->srate = srate;
-	plug->rate_converter = rate_converter;
+	if (rate_converter) {
+		if ((err = snd_config_copy((snd_config_t**)&plug->rate_converter,
+					   (snd_config_t *)rate_converter)) < 0) {
+			free(plug);
+			return err;
+		}
+	}
+
 	plug->gen.slave = plug->req_slave = slave;
 	plug->gen.close_slave = close_slave;
 	plug->route_policy = route_policy;
@@ -1119,6 +1130,10 @@ int snd_pcm_plug_open(snd_pcm_t **pcmp,
 	
 	err = snd_pcm_new(&pcm, SND_PCM_TYPE_PLUG, name, slave->stream, slave->mode);
 	if (err < 0) {
+		if (plug->rate_converter) {
+			snd_config_delete((snd_config_t*)plug->rate_converter);
+			plug->rate_converter = NULL;
+		}
 		free(plug);
 		return err;
 	}
